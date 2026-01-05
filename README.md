@@ -66,7 +66,7 @@ terraform init
 terraform apply
 
 # 3. Tester
-./scripts/test.sh http://$(terraform output -raw lb_public_ip)
+./scripts/deploy-test-ddos.sh
 ```
 
 ## Configuration
@@ -99,14 +99,8 @@ rate_limit_concurrent = 20   # Connexions simultanées
 
 ```bash
 # Script de test complet
-./scripts/test.sh http://<LB_IP>
+./scripts/deploy-test-ddos.sh http://<LB_IP>
 
-# Test manuel avec hey
-hey -n 500 -c 50 http://<LB_IP>/
-
-# Vérifier la stick-table (via bastion)
-ssh -J root@<GW_IP>:61000 root@<HAPROXY_IP> \
-  "echo 'show table fe_main' | socat stdio /run/haproxy/admin.sock"
 ```
 
 ## Résultats Attendus
@@ -131,75 +125,3 @@ poc-ddos-l7/
 │   └── test.sh                             # Script de test
 └── README.md
 ```
-
-## Coûts
-
-| Configuration | Ressources | Coût/mois |
-|---------------|------------|-----------|
-| Production HA | 2 HAProxy + 2 Backends + LB + GW | ~56€ |
-| Mutualisé 45 projets | - | ~1.2€/projet |
-
-## Accès SSH
-
-```bash
-# Via bastion (Public Gateway)
-GW_IP=$(terraform output -raw gateway_public_ip)
-ssh -J root@$GW_IP:61000 root@10.0.1.6  # HAProxy 1
-ssh -J root@$GW_IP:61000 root@10.0.1.7  # HAProxy 2
-```
-
-## Commandes Utiles
-
-```bash
-# Status HAProxy
-systemctl status haproxy
-
-# Stats HAProxy
-curl http://localhost:8404/stats
-
-# Stick-table (IPs trackées)
-echo 'show table fe_main' | socat stdio /run/haproxy/admin.sock
-
-# CrowdSec - Décisions actives
-cscli decisions list
-
-# CrowdSec - Métriques
-cscli metrics
-
-# GeoIP - Nombre de ranges
-wc -l /etc/haproxy/geoip/allowed_ips.acl
-```
-
-## Dépannage
-
-### Backends DOWN dans le LB
-
-Vérifier que le port 8081 répond :
-```bash
-curl http://localhost:8081/health
-```
-
-### Rate limiting ne fonctionne pas
-
-Vérifier la stick-table :
-```bash
-echo 'show table fe_main' | socat stdio /run/haproxy/admin.sock
-```
-
-L'IP client doit apparaître (pas 10.0.1.5).
-
-### CrowdSec ne bloque pas
-
-Vérifier les décisions :
-```bash
-cscli decisions list
-```
-
-Forcer une synchronisation :
-```bash
-/usr/local/bin/crowdsec-haproxy-sync.sh
-```
-
-## Licence
-
-MIT - Claranet pour ANCT
