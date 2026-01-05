@@ -1,4 +1,4 @@
-# POC Anti-DDoS Layer 7 - ANCT
+# POC Anti-DDoS Layer 7 - Scaleway
 
 Solution souveraine de protection DDoS Layer 7 sur infrastructure Scaleway.
 
