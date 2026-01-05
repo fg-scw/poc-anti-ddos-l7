@@ -1,0 +1,106 @@
+#####################################################################
+# TERRAFORM.TFVARS - POC Anti-DDoS L7 Production
+#####################################################################
+
+#####################################################################
+# OBLIGATOIRE - Configuration Scaleway
+#####################################################################
+
+project_id   = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # Votre Project ID Scaleway
+ssh_key_name = "your-ssh-key-name"                     # Nom de la clé SSH dans Scaleway
+
+#####################################################################
+# PROJET
+#####################################################################
+
+project_name = "poc-ddos-l7-anct"
+region       = "fr-par"
+zone         = "fr-par-1"
+tags         = ["production", "ddos-l7", "anct", "terraform", "crowdsec"]
+
+#####################################################################
+# HAPROXY - Haute Disponibilité
+#####################################################################
+
+haproxy_instance_count = 2             # 2 instances pour HA production
+haproxy_instance_type  = "PLAY2-MICRO" # 2 vCPU, 4GB RAM
+
+#####################################################################
+# BACKENDS
+#####################################################################
+
+backend_instance_count = 2
+backend_instance_type  = "PLAY2-PICO"  # 1 vCPU, 2GB RAM
+
+#####################################################################
+# LOAD BALANCER
+#####################################################################
+
+enable_scaleway_lb = true
+lb_type            = "LB-S"  # LB-M ou LB-L pour haute charge
+
+#####################################################################
+# CROWDSEC - Threat Intelligence
+#####################################################################
+
+enable_crowdsec = true
+
+# Optionnel: Clé d'enrôlement CrowdSec Console
+# Créer un compte sur https://app.crowdsec.net pour obtenir cette clé
+# Permet de visualiser les attaques dans un dashboard centralisé
+crowdsec_enroll_key = ""
+
+#####################################################################
+# GEOIP - Restriction Géographique
+#####################################################################
+
+enable_geoip = true
+
+# Clé MaxMind GeoLite2 (gratuite)
+# 1. Créer un compte sur https://www.maxmind.com/en/geolite2/signup
+# 2. Générer une clé de licence dans Account > Manage License Keys
+geoip_license_key = ""
+
+# Activer le blocage géographique (false = monitoring only)
+enable_geoblocking = false  # Mettre true pour bloquer
+
+# Pays autorisés (ISO 3166-1 alpha-2)
+allowed_countries = [
+  # Union Européenne
+  "FR", "DE", "IT", "ES", "PT", "BE", "NL", "LU", "AT", "IE",
+  "FI", "SE", "DK", "PL", "CZ", "SK", "HU", "RO", "BG", "HR",
+  "SI", "EE", "LV", "LT", "CY", "MT", "GR",
+  # EEE + Suisse
+  "CH", "NO", "IS", "LI",
+  # Territoires français d'outre-mer
+  "GP", "MQ", "GF", "RE", "YT", "PM", "BL", "MF", "WF", "PF", "NC"
+]
+
+#####################################################################
+# RATE LIMITING
+#####################################################################
+
+rate_limit_http       = 100  # Max requêtes HTTP / 10s / IP
+rate_limit_conn       = 50   # Max nouvelles connexions / 10s / IP
+rate_limit_err        = 20   # Max erreurs HTTP / 10s / IP (détection scan)
+rate_limit_concurrent = 20   # Max connexions simultanées / IP (anti-Slowloris)
+
+#####################################################################
+# STORAGE
+#####################################################################
+
+sbs_iops = 5000  # 5000 ou 15000 IOPS
+
+#####################################################################
+# SCALEWAY COCKPIT - Monitoring
+#####################################################################
+
+enable_cockpit_monitoring = false
+
+# Endpoints Cockpit (trouvables dans Console > Cockpit > Data sources)
+cockpit_metrics_url = "https://xxxxxxxx.metrics.cockpit.fr-par.scw.cloud"
+cockpit_logs_url    = "https://xxxxxxxx.logs.cockpit.fr-par.scw.cloud"
+
+# Token Cockpit (créer dans Console > Cockpit > Tokens)
+# Permissions requises: Push metrics, Push logs
+cockpit_token = ""

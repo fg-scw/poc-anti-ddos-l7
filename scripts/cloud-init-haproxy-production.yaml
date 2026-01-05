@@ -1,0 +1,525 @@
+#cloud-config
+# POC Anti-DDoS L7 - HAProxy Production Ready
+# Includes: CrowdSec + GeoIP + Rate Limiting + HA
+# Instance: haproxy-${haproxy_index}
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - haproxy
+  - jq
+  - curl
+  - wget
+  - unzip
+  - ca-certificates
+  - gnupg
+  - lua5.4
+  - liblua5.4-dev
+  - lua-socket
+  - socat
+
+write_files:
+  #-----------------------------------------------------------------
+  # HAPROXY CONFIGURATION - Production Ready
+  #-----------------------------------------------------------------
+  - path: /etc/haproxy/haproxy.cfg
+    permissions: '0644'
+    content: |
+      #---------------------------------------------------------------------
+      # HAProxy Configuration - POC Anti-DDoS Layer 7 (Production)
+      # Instance: haproxy-${haproxy_index}
+      # Features: Rate Limiting + CrowdSec + GeoIP
+      #---------------------------------------------------------------------
+      
+      global
+          daemon
+          maxconn 50000
+          log stdout format raw local0
+          
+          # Performance tuning
+          tune.ssl.default-dh-param 2048
+          tune.bufsize 32768
+          tune.maxrewrite 8192
+          
+          # Stats socket for runtime API
+          stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+          stats timeout 30s
+      
+      defaults
+          mode http
+          log global
+          option httplog
+          option dontlognull
+          option http-server-close
+          option forwardfor except 127.0.0.0/8
+          option redispatch
+          retries 3
+          
+          # Timeouts anti-Slowloris
+          timeout connect 5s
+          timeout client 10s
+          timeout server 10s
+          timeout http-request 5s
+          timeout http-keep-alive 5s
+          timeout queue 10s
+          
+          maxconn 5000
+          
+          # Compression
+          compression algo gzip
+          compression type text/html text/plain text/css application/javascript application/json
+      
+      #---------------------------------------------------------------------
+      # FRONTEND - Main Entry Point (with Proxy Protocol from LB)
+      #---------------------------------------------------------------------
+      frontend fe_main
+          # Accept Proxy Protocol v2 from Scaleway LB (provides real client IP)
+          bind *:80 accept-proxy
+          bind *:443 accept-proxy ssl crt /etc/haproxy/certs/default.pem alpn h2,http/1.1
+          
+          # Security headers
+          http-response set-header X-Frame-Options SAMEORIGIN
+          http-response set-header X-Content-Type-Options nosniff
+          http-response set-header X-XSS-Protection "1; mode=block"
+          http-response set-header Referrer-Policy strict-origin-when-cross-origin
+          http-response set-header X-Protected-By "HAProxy+CrowdSec"
+          
+          # Logging
+          capture request header Host len 64
+          capture request header User-Agent len 128
+          capture request header X-Forwarded-For len 64
+          
+          #-----------------------------------------------------------------
+          # STICK TABLE - Rate Limiting & DDoS Detection
+          #-----------------------------------------------------------------
+          stick-table type ip size 200k expire 30s store gpc0,gpc1,conn_cur,conn_rate(10s),http_req_rate(10s),http_err_rate(10s),bytes_out_rate(30s)
+          
+          #-----------------------------------------------------------------
+          # IP TRACKING - Using src (real IP from Proxy Protocol)
+          #-----------------------------------------------------------------
+          http-request track-sc0 src
+          
+          #-----------------------------------------------------------------
+          # CROWDSEC - Threat Intelligence (map-based, updated by bouncer)
+          # The bouncer updates /etc/haproxy/crowdsec/crowdsec-blocklist.map
+          #-----------------------------------------------------------------
+          acl is_crowdsec_blocked src -f /etc/haproxy/crowdsec/crowdsec-blocklist.map
+          http-request deny deny_status 403 content-type "text/plain" string "403 Forbidden - Blocked by CrowdSec\n" if is_crowdsec_blocked
+          
+          #-----------------------------------------------------------------
+          # GEOIP BLOCKING (if enabled)
+          #-----------------------------------------------------------------
+%{ if enable_geoip && enable_geoblocking ~}
+          # GeoIP: Block non-allowed countries
+          acl geo_allowed hdr_ip(X-Forwarded-For,-1) -f /etc/haproxy/geoip/allowed_ips.acl
+          acl geo_allowed_direct src -f /etc/haproxy/geoip/allowed_ips.acl
+          http-request deny deny_status 403 content-type "text/plain" string "403 Forbidden - Geographic restriction\n" unless geo_allowed OR geo_allowed_direct
+%{ endif ~}
+          
+          #-----------------------------------------------------------------
+          # RATE LIMITING - Abuse Detection
+          #-----------------------------------------------------------------
+          acl abuse_conn_cur sc0_conn_cur gt ${rate_limit_concurrent}
+          acl abuse_conn_rate sc0_conn_rate gt ${rate_limit_conn}
+          acl abuse_http_rate sc0_http_req_rate gt ${rate_limit_http}
+          acl abuse_http_err sc0_http_err_rate gt ${rate_limit_err}
+          acl abuse_bandwidth sc0_bytes_out_rate gt 50000000
+          
+          # Rate limiting actions (order matters)
+          http-request deny deny_status 429 content-type "text/plain" string "429 Too Many Requests - Concurrent connections\n" if abuse_conn_cur
+          http-request deny deny_status 429 content-type "text/plain" string "429 Too Many Requests - HTTP rate limit\n" if abuse_http_rate
+          http-request deny deny_status 429 content-type "text/plain" string "429 Too Many Requests - Connection rate\n" if abuse_conn_rate
+          http-request deny deny_status 429 content-type "text/plain" string "429 Too Many Requests - Error rate\n" if abuse_http_err
+          http-request deny deny_status 429 content-type "text/plain" string "429 Too Many Requests - Bandwidth\n" if abuse_bandwidth
+          
+          #-----------------------------------------------------------------
+          # ROUTING
+          #-----------------------------------------------------------------
+          acl is_health_check path /health
+          use_backend bk_health if is_health_check
+          
+          default_backend bk_servers
+      
+      #---------------------------------------------------------------------
+      # BACKEND - Application Servers
+      #---------------------------------------------------------------------
+      backend bk_servers
+          balance roundrobin
+          option httpchk GET /health
+          http-check expect status 200
+          http-response set-header X-Backend-Server %s
+          http-response set-header X-HAProxy-Instance haproxy-${haproxy_index}
+          
+          # __BACKEND_SERVERS__
+      
+      backend bk_health
+          mode http
+          http-request return status 200 content-type "text/plain" string "OK - haproxy-${haproxy_index}\n"
+      
+      #---------------------------------------------------------------------
+      # HEALTH CHECK FRONTEND - For LB (no proxy protocol)
+      #---------------------------------------------------------------------
+      frontend fe_health_lb
+          bind *:8081
+          mode http
+          acl is_health path /health
+          use_backend bk_health if is_health
+          default_backend bk_health
+      
+      #---------------------------------------------------------------------
+      # STATS & MONITORING
+      #---------------------------------------------------------------------
+      frontend stats
+          bind *:8404
+          mode http
+          stats enable
+          stats uri /stats
+          stats refresh 10s
+          stats show-legends
+          stats show-node
+          stats admin if TRUE
+          
+          # Prometheus metrics
+          http-request use-service prometheus-exporter if { path /metrics }
+
+  #-----------------------------------------------------------------
+  # CROWDSEC INSTALLATION SCRIPT (Official Bouncer)
+  #-----------------------------------------------------------------
+  - path: /opt/scripts/install-crowdsec.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      
+      echo "=== Installing CrowdSec ==="
+      
+      # Create crowdsec directory for HAProxy
+      mkdir -p /etc/haproxy/crowdsec
+      touch /etc/haproxy/crowdsec/crowdsec-blocklist.map
+      chown haproxy:haproxy /etc/haproxy/crowdsec/crowdsec-blocklist.map
+      
+      # Add CrowdSec repository
+      curl -s https://install.crowdsec.net | bash
+      
+      # Install CrowdSec
+      apt-get install -y crowdsec
+      
+      # Install HAProxy collection
+      cscli collections install crowdsecurity/haproxy
+      cscli collections install crowdsecurity/http-cve
+      cscli collections install crowdsecurity/whitelist-good-actors
+      
+      # Install parsers
+      cscli parsers install crowdsecurity/haproxy-logs
+      cscli parsers install crowdsecurity/http-logs
+      
+      # Configure CrowdSec to read HAProxy logs
+      cat > /etc/crowdsec/acquis.d/haproxy.yaml << 'ACQUIS'
+      filenames:
+        - /var/log/haproxy.log
+      labels:
+        type: haproxy
+      ACQUIS
+      
+      # Install the firewall bouncer (updates iptables + map file)
+      apt-get install -y crowdsec-firewall-bouncer-iptables
+      
+      # Create a custom bouncer script to update HAProxy map
+      cat > /usr/local/bin/crowdsec-haproxy-sync.sh << 'SYNC'
+      #!/bin/bash
+      # Sync CrowdSec decisions to HAProxy map file
+      MAP_FILE="/etc/haproxy/crowdsec/crowdsec-blocklist.map"
+      
+      # Get all banned IPs from CrowdSec
+      cscli decisions list -o json 2>/dev/null | jq -r '.[] | select(.type == "ban") | .value' > "$MAP_FILE.tmp" 2>/dev/null || true
+      
+      # Only update if different
+      if ! diff -q "$MAP_FILE" "$MAP_FILE.tmp" > /dev/null 2>&1; then
+          mv "$MAP_FILE.tmp" "$MAP_FILE"
+          chown haproxy:haproxy "$MAP_FILE"
+          # Reload HAProxy map without restart
+          echo "clear map /etc/haproxy/crowdsec/crowdsec-blocklist.map" | socat stdio /run/haproxy/admin.sock 2>/dev/null || true
+          while read ip; do
+              [ -n "$ip" ] && echo "add map /etc/haproxy/crowdsec/crowdsec-blocklist.map $ip 1" | socat stdio /run/haproxy/admin.sock 2>/dev/null || true
+          done < "$MAP_FILE"
+          logger "CrowdSec: Updated HAProxy blocklist with $(wc -l < $MAP_FILE) IPs"
+      else
+          rm -f "$MAP_FILE.tmp"
+      fi
+      SYNC
+      chmod +x /usr/local/bin/crowdsec-haproxy-sync.sh
+      
+      # Add cron job to sync every minute
+      echo "* * * * * root /usr/local/bin/crowdsec-haproxy-sync.sh" > /etc/cron.d/crowdsec-haproxy
+      
+      # Enable and start CrowdSec
+      systemctl enable crowdsec
+      systemctl restart crowdsec
+      
+      # Enroll to CrowdSec Console (optional)
+      ENROLL_KEY="${crowdsec_enroll_key}"
+      if [ -n "$ENROLL_KEY" ]; then
+          cscli console enroll "$ENROLL_KEY" || true
+      fi
+      
+      # Initial sync
+      /usr/local/bin/crowdsec-haproxy-sync.sh
+      
+      echo "=== CrowdSec installed ==="
+      echo "Blocklist map: /etc/haproxy/crowdsec/crowdsec-blocklist.map"
+      echo "Sync cron: /etc/cron.d/crowdsec-haproxy"
+
+  #-----------------------------------------------------------------
+  # GEOIP INSTALLATION SCRIPT
+  #-----------------------------------------------------------------
+  - path: /opt/scripts/install-geoip.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      
+      echo "=== Installing GeoIP ==="
+      
+      GEOIP_KEY="${geoip_license_key}"
+      ALLOWED_COUNTRIES='${jsonencode(allowed_countries)}'
+      
+      mkdir -p /etc/haproxy/geoip
+      cd /etc/haproxy/geoip
+      
+      if [ -z "$GEOIP_KEY" ]; then
+          echo "No MaxMind license key provided, using fallback method..."
+          
+          # Fallback: Use IP2Location LITE (free, no registration)
+          wget -q "https://download.ip2location.com/lite/IP2LOCATION-LITE-DB1.CSV.ZIP" -O ip2location.zip || true
+          
+          if [ -f ip2location.zip ]; then
+              unzip -o ip2location.zip
+              
+              # Generate allowed IPs ACL for each country
+              > allowed_ips.acl
+              for country in $(echo "$ALLOWED_COUNTRIES" | jq -r '.[]'); do
+                  echo "Processing country: $country"
+                  # IP2Location format: "start_ip","end_ip","country_code","country_name"
+                  grep "\"$country\"" IP2LOCATION-LITE-DB1.CSV 2>/dev/null | \
+                      awk -F',' '{gsub(/"/, "", $1); gsub(/"/, "", $2); print $1"-"$2}' >> allowed_ips.acl || true
+              done
+          fi
+      else
+          echo "Downloading MaxMind GeoLite2..."
+          
+          # Download MaxMind GeoLite2 Country
+          wget -q "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country-CSV&license_key=$GEOIP_KEY&suffix=zip" -O GeoLite2-Country-CSV.zip
+          unzip -o GeoLite2-Country-CSV.zip
+          
+          # Generate allowed IPs ACL
+          > allowed_ips.acl
+          
+          # Get location IDs for allowed countries
+          for country in $(echo "$ALLOWED_COUNTRIES" | jq -r '.[]'); do
+              echo "Processing country: $country"
+              # Get geoname_id for this country
+              geoname_ids=$(grep ",$country," GeoLite2-Country-CSV_*/GeoLite2-Country-Locations-en.csv | cut -d',' -f1)
+              
+              for geoname_id in $geoname_ids; do
+                  # Get all CIDRs for this geoname_id
+                  grep ",$geoname_id," GeoLite2-Country-CSV_*/GeoLite2-Country-Blocks-IPv4.csv | \
+                      cut -d',' -f1 >> allowed_ips.acl
+              done
+          done
+      fi
+      
+      # Count entries
+      if [ -f allowed_ips.acl ]; then
+          entries=$(wc -l < allowed_ips.acl)
+          echo "=== GeoIP installed: $entries IP ranges for allowed countries ==="
+      else
+          echo "=== GeoIP: No data available, creating empty ACL ==="
+          touch allowed_ips.acl
+      fi
+
+  #-----------------------------------------------------------------
+  # SCALEWAY COCKPIT MONITORING (Grafana Alloy)
+  #-----------------------------------------------------------------
+  - path: /opt/scripts/install-cockpit.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      
+      echo "=== Installing Scaleway Cockpit Monitoring ==="
+      
+      COCKPIT_METRICS_URL="${cockpit_metrics_url}"
+      COCKPIT_LOGS_URL="${cockpit_logs_url}"
+      COCKPIT_TOKEN="${cockpit_token}"
+      HOSTNAME=$(hostname)
+      
+      if [ -z "$COCKPIT_TOKEN" ]; then
+          echo "WARN: No Cockpit token provided, skipping monitoring setup"
+          exit 0
+      fi
+      
+      # Install Grafana Alloy
+      apt-get install -y apt-transport-https software-properties-common wget
+      mkdir -p /etc/apt/keyrings/
+      wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor > /etc/apt/keyrings/grafana.gpg
+      echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" > /etc/apt/sources.list.d/grafana.list
+      
+      apt-get update
+      apt-get install -y alloy
+      
+      # Create Alloy configuration
+      cat > /etc/alloy/config.alloy << ALLOY_EOF
+      // Scaleway Cockpit - HAProxy Monitoring
+      
+      // System metrics (node_exporter)
+      prometheus.exporter.unix "system" {
+        include_exporter_metrics = true
+        disable_collectors = ["textfile"]
+      }
+      
+      prometheus.scrape "system" {
+        targets    = prometheus.exporter.unix.system.targets
+        forward_to = [prometheus.remote_write.cockpit.receiver]
+        scrape_interval = "30s"
+        job_name        = "node"
+      }
+      
+      // HAProxy metrics (prometheus exporter on :8404)
+      prometheus.scrape "haproxy" {
+        targets = [{"__address__" = "localhost:8404", "job" = "haproxy", "instance" = "$HOSTNAME"}]
+        forward_to = [prometheus.remote_write.cockpit.receiver]
+        scrape_interval = "15s"
+        metrics_path    = "/metrics"
+      }
+      
+      // Send metrics to Cockpit
+      prometheus.remote_write "cockpit" {
+        endpoint {
+          url = "$COCKPIT_METRICS_URL/api/v1/push"
+          headers = {
+            "X-Token" = "$COCKPIT_TOKEN",
+          }
+        }
+      }
+      
+      // Logs from systemd journal
+      loki.source.journal "systemd" {
+        forward_to = [loki.write.cockpit.receiver]
+        labels = {
+          job      = "systemd",
+          instance = "$HOSTNAME",
+        }
+      }
+      
+      // Send logs to Cockpit
+      loki.write "cockpit" {
+        endpoint {
+          url = "$COCKPIT_LOGS_URL/loki/api/v1/push"
+          headers = {
+            "X-Token" = "$COCKPIT_TOKEN",
+          }
+        }
+      }
+      ALLOY_EOF
+      
+      # Enable rsyslog for HAProxy file logs
+      cat > /etc/rsyslog.d/49-haproxy.conf << 'RSYSLOG_EOF'
+      local0.* /var/log/haproxy.log
+      & stop
+      RSYSLOG_EOF
+      systemctl restart rsyslog
+      
+      # Start Alloy
+      systemctl daemon-reload
+      systemctl enable alloy
+      systemctl start alloy
+      
+      echo "=== Cockpit monitoring installed ==="
+      echo "Metrics: $COCKPIT_METRICS_URL"
+      echo "Logs: $COCKPIT_LOGS_URL"
+
+  #-----------------------------------------------------------------
+  # SSL CERTIFICATE GENERATION
+  #-----------------------------------------------------------------
+  - path: /opt/scripts/generate-ssl.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      
+      mkdir -p /etc/haproxy/certs
+      
+      # Generate self-signed certificate
+      openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/haproxy/certs/default.key \
+        -out /etc/haproxy/certs/default.crt \
+        -subj "/C=FR/ST=IDF/L=Paris/O=ANCT/OU=POC-DDoS/CN=haproxy-${haproxy_index}"
+      
+      # Combine for HAProxy
+      cat /etc/haproxy/certs/default.crt /etc/haproxy/certs/default.key > /etc/haproxy/certs/default.pem
+      chmod 600 /etc/haproxy/certs/default.pem
+      
+      echo "SSL certificate generated"
+
+runcmd:
+  # Create directories and empty files BEFORE HAProxy starts
+  - mkdir -p /run/haproxy
+  - mkdir -p /etc/haproxy/crowdsec
+  - mkdir -p /etc/haproxy/geoip
+  - touch /etc/haproxy/crowdsec/crowdsec-blocklist.map
+  - touch /etc/haproxy/geoip/allowed_ips.acl
+  - chown -R haproxy:haproxy /run/haproxy /etc/haproxy/crowdsec
+  
+  # Generate SSL certificate
+  - /opt/scripts/generate-ssl.sh
+  
+  # Inject backend servers BEFORE validation
+  - |
+    echo "=== Injecting backend servers ==="
+    BACKEND_IPS='${backend_ips}'
+    SERVERS=""
+    INDEX=1
+    for IP in $(echo "$BACKEND_IPS" | jq -r '.[]'); do
+      if [ -n "$IP" ] && [ "$IP" != "null" ]; then
+        SERVERS="$SERVERS\n    server backend-$INDEX $IP:80 check inter 5s fall 3 rise 2"
+        echo "Backend $INDEX: $IP"
+        INDEX=$((INDEX + 1))
+      fi
+    done
+    sed -i "s|# __BACKEND_SERVERS__|$SERVERS|" /etc/haproxy/haproxy.cfg
+    echo "=== Backends configured ==="
+    grep -A10 "backend bk_servers" /etc/haproxy/haproxy.cfg
+  
+  # Validate HAProxy configuration
+  - haproxy -c -f /etc/haproxy/haproxy.cfg
+  
+  # Start HAProxy (with empty blocklists initially)
+  - systemctl enable haproxy
+  - systemctl restart haproxy
+  
+  # Verify HAProxy is running
+  - systemctl status haproxy --no-pager || true
+  
+  # Install CrowdSec AFTER HAProxy is running (if enabled)
+%{ if enable_crowdsec ~}
+  - /opt/scripts/install-crowdsec.sh
+%{ endif ~}
+  
+  # Install GeoIP AFTER HAProxy is running (if enabled)
+%{ if enable_geoip ~}
+  - /opt/scripts/install-geoip.sh
+  # Reload HAProxy to pick up GeoIP data
+  - systemctl reload haproxy || true
+%{ endif ~}
+
+  # Install Scaleway Cockpit monitoring (if enabled)
+%{ if enable_cockpit_monitoring ~}
+  - /opt/scripts/install-cockpit.sh
+%{ endif ~}
+  
+  # Log completion
+  - echo "=== HAProxy ${haproxy_index} ready with CrowdSec + GeoIP ===" | tee /var/log/cloud-init-complete.log
+  - date >> /var/log/cloud-init-complete.log
+
+final_message: "HAProxy ${haproxy_index} ready after $UPTIME seconds"
