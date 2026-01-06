@@ -191,7 +191,7 @@ resource "scaleway_instance_server" "backend" {
   }
 
   user_data = {
-    cloud-init = templatefile("${path.module}/scripts/cloud-init-backend.yaml", {
+    cloud-init = templatefile("${path.module}/cloud-init/cloud-init-backend.yaml", {
       backend_index = count.index + 1
     })
   }
@@ -251,7 +251,7 @@ resource "scaleway_instance_server" "haproxy" {
 
   # Cloud-init Production avec CrowdSec + GeoIP
   user_data = {
-    cloud-init = templatefile("${path.module}/scripts/cloud-init-haproxy-production.yaml", {
+    cloud-init = templatefile("${path.module}/cloud-init/cloud-init-haproxy-production.yaml", {
       haproxy_index         = count.index + 1
       
       # CrowdSec configuration
